@@ -1,0 +1,12 @@
+streamlit>=1.24.0
+python-dotenv
+PyPDF2
+langchain
+langchain-community
+langchain-text-splitters
+bcrypt
+pymongo
+faiss-cpu
+requests
+sentence-transformers
+torch
