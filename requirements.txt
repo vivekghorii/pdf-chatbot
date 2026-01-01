@@ -10,3 +10,6 @@ faiss-cpu
 requests
 sentence-transformers
 torch
+SpeechRecognition>=3.10.0
+pydub>=0.25.1
+streamlit-audio-recorder>=0.0.8
