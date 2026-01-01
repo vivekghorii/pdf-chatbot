@@ -10,3 +10,4 @@ faiss-cpu
 requests
 sentence-transformers
 torch
+
