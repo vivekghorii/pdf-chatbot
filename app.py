@@ -13,16 +13,6 @@ import requests
 from datetime import datetime, UTC
 import re
 import torch
-import speech_recognition as sr
-import tempfile
-try:
-    from audio_recorder_streamlit import audio_recorder
-except ImportError:
-    # Fallback: try alternative import
-    try:
-        from streamlit_audio_recorder import audio_recorder
-    except ImportError:
-        audio_recorder = None
 
 # Load environment variables
 load_dotenv()
@@ -60,8 +50,6 @@ def init_session_state():
         st.session_state.current_subject = None
     if 'chat_history' not in st.session_state:
         st.session_state.chat_history = []
-    if 'vector_store' not in st.session_state:
-        st.session_state.vector_store = None
 
 def hash_password(password):
     return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
@@ -123,86 +111,27 @@ def get_chat_history(subject_id):
         'subject_id': subject_id
     }).sort('timestamp', 1))
 
-# Speech to text conversion
-def speech_to_text(audio_bytes):
-    """Convert audio bytes to text using speech recognition"""
-    try:
-        # Create a temporary file to store audio
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_file:
-            tmp_file.write(audio_bytes)
-            tmp_path = tmp_file.name
-        
-        # Initialize recognizer
-        r = sr.Recognizer()
-        
-        # Read audio file
-        with sr.AudioFile(tmp_path) as source:
-            audio = r.record(source)
-        
-        # Recognize speech using Google's free API
-        try:
-            text = r.recognize_google(audio)
-            os.unlink(tmp_path)  # Clean up temp file
-            return text
-        except sr.UnknownValueError:
-            os.unlink(tmp_path)
-            return None
-        except sr.RequestError as e:
-            os.unlink(tmp_path)
-            st.error(f"Could not request results from speech recognition service: {e}")
-            return None
-    except Exception as e:
-        st.error(f"Error processing audio: {str(e)}")
-        return None
-
-# OpenRouter call with conversation context and strict PDF-only answers
-def get_openrouter_response(prompt, subject_name, chat_history_context="", has_pdf_context=False):
+# OpenRouter call (uses MODEL_NAME)
+def get_openrouter_response(prompt, subject_name):
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
         "Referer": "http://localhost:8501",
         "X-Title": "PDF Chatbot"
     }
-    
-    # Build system message with strict rules
-    system_content = f"""You are a PDF-based AI assistant specialized in {subject_name}.
-
-CRITICAL RULES:
-1. Answer questions STRICTLY using ONLY the content from the uploaded PDF documents.
-2. Do NOT use any external knowledge or information not found in the PDF.
-3. If the answer is not found in the PDF context provided, you MUST reply with exactly: "This information is not available in the uploaded document."
-4. Keep answers simple, clear, and easy to understand.
-5. Maintain conversation context for follow-up questions."""
-    
-    # Build messages with conversation history
-    messages = [{"role": "system", "content": system_content}]
-    
-    # Add conversation history if available
-    if chat_history_context:
-        messages.append({"role": "user", "content": f"Previous conversation context:\n{chat_history_context}"})
-    
-    # Add current prompt
-    messages.append({"role": "user", "content": prompt})
-    
     data = {
         "model": MODEL_NAME,
-        "messages": messages
+        "messages": [
+            {"role": "system", "content": f"You are a helpful assistant specialized in {subject_name}."},
+            {"role": "user", "content": prompt}
+        ]
     }
-    
     try:
         resp = requests.post(OPENROUTER_API_URL, headers=headers, json=data, timeout=20)
         resp.raise_for_status()
         result = resp.json()
         if 'choices' in result and result['choices']:
-            response = result['choices'][0]['message'].get('content', '').strip()
-            
-            # If no PDF context was provided but user asked a question, return the specific message
-            if not has_pdf_context and response and not response.startswith("This information is not available"):
-                # Check if response seems to be using external knowledge
-                # For now, we'll trust the model with the strict prompt, but we can add validation
-                pass
-            
-            return response
+            return result['choices'][0]['message'].get('content', '').strip()
         else:
             err = f"OpenRouter API error: {json.dumps(result)}"
             st.error(err)
@@ -313,6 +242,7 @@ def main():
 
             # PDF upload and processing (better handling & chunking)
             pdfs = st.file_uploader("Upload PDF(s)", type="pdf", accept_multiple_files=True)
+            VectorStore = None
             if pdfs:
                 texts = []
                 for pdf in pdfs:
@@ -330,93 +260,35 @@ def main():
                     # create embeddings and store to FAISS (in-memory vector store)
                     try:
                         embeddings = get_embeddings()
-                        st.session_state.vector_store = FAISS.from_texts(chunks, embeddings)
+                        VectorStore = FAISS.from_texts(chunks, embeddings)
                         st.success("Documents processed and stored.")
                     except Exception as e:
                         st.error(f"Error storing embeddings: {e}")
-                        st.session_state.vector_store = None
+                        VectorStore = None
 
-            # Chat interface with text and voice input
-            st.subheader("Ask questions about your PDFs")
-            
-            # Create two columns for text input and microphone
-            col1, col2 = st.columns([4, 1])
-            
-            with col1:
-                query = st.text_input("Type your question here", key="text_input", label_visibility="collapsed")
-            
-            with col2:
-                st.write("")  # Spacing
-                st.write("")  # Spacing
-                if audio_recorder:
-                    audio_bytes = audio_recorder(text="🎤", icon_size="2x")
-                else:
-                    audio_bytes = None
-                    st.markdown("🎤")
-                    st.caption("Voice input")
-            
-            # Process voice input
-            voice_query = None
-            if audio_bytes:
-                with st.spinner("Converting speech to text..."):
-                    voice_text = speech_to_text(audio_bytes)
-                    if voice_text:
-                        st.success(f"Recognized: {voice_text}")
-                        voice_query = voice_text
-                    else:
-                        st.warning("Could not recognize speech. Please try again or type your question.")
-            
-            # Use voice query if available, otherwise use text input
-            final_query = voice_query if voice_query else query
-            
-            # Process query (from text or voice)
-            if final_query and final_query.strip():
-                display_chat_message(final_query, True)
+            # Chat interface
+            query = st.text_input("Ask questions about your PDFs")
+            if query:
+                display_chat_message(query, True)
                 try:
-                    # Build conversation context from chat history
-                    chat_context = ""
-                    if st.session_state.chat_history:
-                        recent_chats = st.session_state.chat_history[-5:]  # Last 5 exchanges for context
-                        chat_context = "\n".join([
-                            f"User: {chat['message']}\nAssistant: {chat['response']}"
-                            for chat in recent_chats
-                        ])
-                    
-                    has_pdf_context = False
-                    if st.session_state.vector_store:
-                        results = st.session_state.vector_store.similarity_search(query=final_query, k=3)
+                    if VectorStore:
+                        results = VectorStore.similarity_search(query=query, k=3)
                         if results:
                             context_chunks = [r.page_content for r in results if getattr(r, 'page_content', None)]
-                            if context_chunks:
-                                context = "\n\n".join([f"Chunk {i+1}: {chunk}" for i, chunk in enumerate(context_chunks)])
-                                prompt = (
-                                    "Use ONLY the following context from the uploaded PDF documents to answer the question.\n\n"
-                                    f"Context from PDF documents:\n{context}\n\n"
-                                    f"Question: {final_query}\n\n"
-                                    "If the answer cannot be found in the provided context, reply with exactly: 'This information is not available in the uploaded document.'"
-                                )
-                                has_pdf_context = True
-                            else:
-                                prompt = f"Question: {final_query}\n\nNote: No relevant context found in PDF. Reply with exactly: 'This information is not available in the uploaded document.'"
+                            context = "\n\n".join([f"Chunk {i+1}: {chunk}" for i, chunk in enumerate(context_chunks)])
+                            prompt = (
+                                "You are a helpful assistant. Use the following context from documents to answer the question.\n\n"
+                                f"Context from docs:\n{context}\n\nQuestion: {query}"
+                            )
+                            response = get_openrouter_response(prompt, st.session_state.current_subject['name'])
                         else:
-                            prompt = f"Question: {final_query}\n\nNote: No relevant context found in PDF. Reply with exactly: 'This information is not available in the uploaded document.'"
+                            response = get_openrouter_response(query, st.session_state.current_subject['name'])
                     else:
-                        # No PDF uploaded
-                        prompt = f"Question: {final_query}\n\nNote: No PDF documents have been uploaded. Reply with exactly: 'This information is not available in the uploaded document.'"
-                    
-                    # Get response with conversation context
-                    response = get_openrouter_response(
-                        prompt, 
-                        st.session_state.current_subject['name'],
-                        chat_history_context=chat_context,
-                        has_pdf_context=has_pdf_context
-                    )
-                    
+                        response = get_openrouter_response(query, st.session_state.current_subject['name'])
+
                     display_chat_message(response, False)
-                    save_chat_message(st.session_state.current_subject['_id'], final_query, response)
+                    save_chat_message(st.session_state.current_subject['_id'], query, response)
                     st.session_state.chat_history = get_chat_history(st.session_state.current_subject['_id'])
-                    st.session_state.current_query = ""  # Clear query after processing
-                    st.rerun()  # Rerun to clear input and update UI
                 except Exception as e:
                     st.error(f"Error processing query: {str(e)}")
 
